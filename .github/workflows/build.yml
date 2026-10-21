@@ -56,7 +56,9 @@ jobs:
           cache: npm
       - run: npm ci
       # Quiet test output here: logs of a public repository are public.
-      - run: npm test -- --test-reporter=dot
+      - run: npm test
+        env:
+          NODE_OPTIONS: --test-reporter=dot
 
       - name: Speech engine (whisper.cpp)
         shell: bash
