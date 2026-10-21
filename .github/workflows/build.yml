@@ -55,7 +55,8 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
-      - run: npm test
+      # Quiet test output here: logs of a public repository are public.
+      - run: npm test -- --test-reporter=dot
 
       - name: Speech engine (whisper.cpp)
         shell: bash
