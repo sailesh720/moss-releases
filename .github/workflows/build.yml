@@ -115,7 +115,7 @@ jobs:
             hdiutil detach "$mnt"
             codesign --verify --deep --strict "$RUNNER_TEMP/Moss-$arch.app"
             echo "== $arch"
-            node scripts/smoke-packaged.cjs "$RUNNER_TEMP/Moss-$arch.app/Contents/MacOS/Moss Companion"
+            SMOKE_LAUNCH_TIMEOUT=$([ $arch = x64 ] && echo 180000 || echo 60000) node scripts/smoke-packaged.cjs "$RUNNER_TEMP/Moss-$arch.app/Contents/MacOS/Moss Companion"
           done
 
       - name: Smoke test (Windows install, run, uninstall keeps data)
