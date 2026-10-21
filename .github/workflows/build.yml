@@ -1,0 +1,223 @@
+# Builds Moss's installers on each system, installs and smoke-tests them, then
+# creates a DRAFT release here with SHA256SUMS.txt and the signed update notice
+# (latest.json). Nothing is public until the owner presses Publish.
+#
+# Start a build: push a change to build-request.json on this branch with the
+# source commit ("ref") and "version". Runs here because public repositories
+# get free build minutes; the source stays in the private repository.
+name: Build release
+on:
+  push:
+    branches: [builder]
+    paths: [build-request.json]
+permissions:
+  contents: write
+env:
+  WHISPER_VERSION: 1.9.5
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      ref: ${{ steps.r.outputs.ref }}
+      version: ${{ steps.r.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: r
+        run: |
+          echo "ref=$(jq -r .ref build-request.json)" >> "$GITHUB_OUTPUT"
+          echo "version=$(jq -r .version build-request.json)" >> "$GITHUB_OUTPUT"
+  build:
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: mac
+          - os: windows-latest
+            target: win
+          # 22.04: an older glibc, so the AppImage also runs on older distributions.
+          - os: ubuntu-22.04
+            target: linux
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      # The app's source lives in a private repository; a read-only deploy key fetches
+      # it onto this temporary machine. It is never committed or published here.
+      - uses: actions/checkout@v4
+        with:
+          repository: sailesh720/moss-companion
+          ref: ${{ needs.plan.outputs.ref }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm test
+
+      - name: Speech engine (whisper.cpp)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ "${{ matrix.target }}" = mac ]; then
+            node scripts/fetch-speech-engine.cjs --version "$WHISPER_VERSION" --arch arm64
+            node scripts/fetch-speech-engine.cjs --version "$WHISPER_VERSION" --arch x64
+          else
+            node scripts/fetch-speech-engine.cjs --version "$WHISPER_VERSION"
+          fi
+          ls -la vendor/runtime/*/
+
+      - name: Minify app code
+        run: node scripts/minify-app.cjs
+
+      - name: Build
+        shell: bash
+        env:
+          MAC_CERT: ${{ secrets.MAC_CERT_P12_BASE64 }}
+          MAC_CERT_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
+          WIN_CERT: ${{ secrets.WIN_CERT_PFX_BASE64 }}
+          WIN_CERT_PASSWORD: ${{ secrets.WIN_CERT_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          extra=""
+          case "${{ matrix.target }}" in
+            mac)
+              if [ -n "$MAC_CERT" ]; then export CSC_LINK="$MAC_CERT" CSC_KEY_PASSWORD="$MAC_CERT_PASSWORD";
+              # Unsigned: ad-hoc signature, and no hardened runtime (it exists for notarization,
+              # and with an ad-hoc signature its library validation stops Electron loading).
+              else export CSC_IDENTITY_AUTO_DISCOVERY=false; extra="-c.mac.identity=- -c.mac.hardenedRuntime=false"; fi
+              if [ -z "$MAC_CERT" ] || [ -z "$APPLE_ID" ]; then extra="$extra -c.mac.notarize=false"; fi
+              npx electron-builder --mac --publish never $extra ;;
+            win)
+              if [ -n "$WIN_CERT" ]; then export CSC_LINK="$WIN_CERT" CSC_KEY_PASSWORD="$WIN_CERT_PASSWORD";
+              else export CSC_IDENTITY_AUTO_DISCOVERY=false; fi
+              npx electron-builder --win nsis --x64 --publish never ;;
+            linux)
+              npx electron-builder --linux --publish never ;;
+          esac
+          ls -la release
+
+      - name: Smoke test (macOS, Apple Silicon and Intel via Rosetta)
+        if: matrix.target == 'mac'
+        shell: bash
+        run: |
+          set -e
+          for arch in arm64 x64; do
+            dmg=$(ls release/*-mac-$arch.dmg)
+            mnt=$(mktemp -d)
+            hdiutil attach "$dmg" -nobrowse -readonly -mountpoint "$mnt"
+            cp -R "$mnt/Moss Companion.app" "$RUNNER_TEMP/Moss-$arch.app"
+            hdiutil detach "$mnt"
+            codesign --verify --deep --strict "$RUNNER_TEMP/Moss-$arch.app"
+            echo "== $arch"
+            node scripts/smoke-packaged.cjs "$RUNNER_TEMP/Moss-$arch.app/Contents/MacOS/Moss Companion"
+          done
+
+      - name: Smoke test (Windows install, run, uninstall keeps data)
+        if: matrix.target == 'win'
+        shell: pwsh
+        run: |
+          $setup = Get-ChildItem release/*-windows-x64-setup.exe | Select-Object -First 1
+          Start-Process $setup.FullName -ArgumentList '/S' -Wait
+          $dir = Join-Path $env:LOCALAPPDATA 'Programs\Moss Companion'
+          $exe = Join-Path $dir 'Moss Companion.exe'
+          if (!(Test-Path $exe)) { throw "Not installed at $exe" }
+          if (!(Test-Path (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Moss Companion.lnk'))) { throw 'No Start Menu shortcut' }
+          node scripts/smoke-packaged.cjs $exe
+          if ($LASTEXITCODE -ne 0) { throw 'Smoke test failed' }
+          # Uninstalling keeps the person's data unless they choose to delete it.
+          $data = Join-Path $env:APPDATA 'moss-companion'
+          New-Item -ItemType Directory -Force $data | Out-Null
+          Set-Content (Join-Path $data 'keep-me.txt') 'data'
+          Start-Process (Join-Path $dir 'Uninstall Moss Companion.exe') -ArgumentList '/S' -Wait
+          Start-Sleep -Seconds 5
+          if (Test-Path $exe) { throw 'Still installed after uninstall' }
+          if (!(Test-Path (Join-Path $data 'keep-me.txt'))) { throw 'Uninstall deleted user data' }
+          Write-Host 'ok   uninstall removed the app and kept user data'
+
+      - name: Smoke test (Linux .deb and AppImage)
+        if: matrix.target == 'linux'
+        shell: bash
+        run: |
+          set -e
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xvfb
+          deb=$(ls release/*.deb | head -1)
+          sudo apt-get install -y "./$deb"
+          echo "== .deb"
+          xvfb-run -a node scripts/smoke-packaged.cjs "/opt/Moss Companion/moss-companion"
+          sudo apt-get remove -y moss-companion
+          app=$(ls release/*.AppImage | head -1)
+          chmod +x "$app"
+          (cd "$RUNNER_TEMP" && "$GITHUB_WORKSPACE/$app" --appimage-extract > /dev/null)
+          echo "== AppImage"
+          SMOKE_NO_SANDBOX=1 xvfb-run -a node scripts/smoke-packaged.cjs "$RUNNER_TEMP/squashfs-root/moss-companion"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installers-${{ matrix.target }}
+          retention-days: 14
+          if-no-files-found: error
+          path: |
+            release/*.dmg
+            release/*-mac-*.zip
+            release/*-setup.exe
+            release/*.AppImage
+            release/*.deb
+
+  draft:
+    needs: [plan, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: sailesh720/moss-companion
+          ref: ${{ needs.plan.outputs.ref }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          path: release
+          merge-multiple: true
+      - run: node scripts/checksums.cjs release && ls -la release
+      - name: Signed update notice (latest.json)
+        env:
+          UPDATE_KEY: ${{ secrets.MOSS_UPDATE_KEY }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          umask 077
+          printf '%s\n' "$UPDATE_KEY" > "$RUNNER_TEMP/update-key.pem"
+          node scripts/release-sign.cjs manifest --version "$VERSION" \
+            --notes "What's new: https://moss-companion.vercel.app/changelog/" \
+            --key "$RUNNER_TEMP/update-key.pem" \
+            --base-url "https://github.com/${{ github.repository }}/releases/download/v$VERSION/" \
+            --out release/latest.json \
+            release/*-mac-*.zip release/*-setup.exe release/*.AppImage
+          rm -f "$RUNNER_TEMP/update-key.pem"
+          node -e "const m=require('./release/latest.json');console.log(m.version, m.assets.map(a=>a.platform+'/'+a.arch).join(' '))"
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          tag_name: v${{ needs.plan.outputs.version }}
+          target_commitish: main
+          name: Moss Companion v${{ needs.plan.outputs.version }}
+          body: |
+            Moss Companion ${{ needs.plan.outputs.version }}. What's new: https://moss-companion.vercel.app/changelog/
+
+            Downloads: Mac (Apple Silicon and Intel), Windows 10 and 11 (64-bit) and Linux (64-bit AppImage and .deb).
+            Installed copies of Moss offer this update by themselves (Settings › Updates).
+            Check a download against SHA256SUMS.txt. These builds are not signed with paid certificates yet:
+            on a Mac choose Open Anyway in System Settings › Privacy & Security; on Windows choose More info › Run anyway.
+          files: |
+            release/*.dmg
+            release/*-mac-*.zip
+            release/*-setup.exe
+            release/*.AppImage
+            release/*.deb
+            release/SHA256SUMS.txt
+            release/latest.json
